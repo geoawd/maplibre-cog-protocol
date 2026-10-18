@@ -66,12 +66,12 @@
 <body>
 <div id="map"></div>
 <div id="panel">
-  <h1>Linford LiDAR: DTM and DSM</h1>
+  <h1>Linford LiDAR: DTM</h1>
 
-  <label><input type="checkbox" id="toggleDtm" checked> Linford_DTM_3857.tif (terrain)</label>
+  <label><input type="checkbox" id="toggleDtm" checked> Linford_DTM_3857.tif (EPSG:3857)</label>
   <div class="note">Produced using GDAL in Python. Already in EPSG:3857, so it is read directly.</div>
 
-  <label><input type="checkbox" id="toggleDsm"> Linford_DSM.tif (surface)</label>
+  <label><input type="checkbox" id="toggleDsm"> Linford_DTM.tif (EPSG:29902)</label>
   <div class="note">Re-projected: it is in the Irish Grid (EPSG:29902), not EPSG:3857, so the library reprojects it on the fly.</div>
 
   <div class="status" id="status">Reading COG metadata…</div>
@@ -81,7 +81,7 @@
   import * as maplibregl from 'https://unpkg.com/maplibre-gl@^6.0.0/dist/maplibre-gl.mjs';
 
   const DTM_URL = 'https://data.better-open-data.com/lidar_zstd/Linford_DTM_3857.tif';
-  const DSM_URL = 'https://data.better-open-data.com/lidar_zstd/Linford_DSM.tif';
+  const DSM_URL = 'https://data.better-open-data.com/lidar_zstd/Linford_DTM.tif';
 
   // The DSM is in the Irish Grid (EPSG:29902), which the library knows, so there is nothing to
   // register. (A CRS it does not know is taught with MaplibreCOGProtocol.registerProjection.)
@@ -165,8 +165,8 @@
       const height = (result) => (result.status === 'fulfilled' && Number.isFinite(result.value[0])) ? result.value[0] : NaN;
       const [t, s] = [height(dtm), height(dsm)];
       const fmt = (value) => Number.isNaN(value) ? 'no data' : `${value.toFixed(1)} m`;
-      readout.textContent = `DTM ${fmt(t)}\nDSM ${fmt(s)}` +
-        (Number.isNaN(t) || Number.isNaN(s) ? '' : `\nDSM - DTM ${(s - t).toFixed(1)} m`);
+      readout.textContent = `EPSG:3857 ${fmt(t)}\nEPSG:29902 ${fmt(s)}` +
+        (Number.isNaN(t) || Number.isNaN(s) ? '' : `\nEPSG:3857 - EPSG:29902 ${(s - t).toFixed(1)} m`);
       readout.style.whiteSpace = 'pre';
     }).finally(() => busy = false);
   });
