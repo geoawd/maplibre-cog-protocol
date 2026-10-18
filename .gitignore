@@ -5,3 +5,4 @@ junit.xml
 
 .idea
 geomatico-maplibre-cog-protocol-*.tgz
+.DS_Store

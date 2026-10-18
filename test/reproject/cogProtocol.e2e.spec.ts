@@ -1,6 +1,6 @@
 import {resolve} from 'node:path';
 
-import {afterAll, beforeAll, describe, expect, test, vi} from 'vitest';
+import {afterAll, afterEach, beforeAll, describe, expect, test, vi} from 'vitest';
 
 import cogProtocol from '../../src/cogProtocol';
 import {TILE_SIZE} from '../../src/constants';
@@ -31,6 +31,9 @@ beforeAll(async () => {
   ({url, close} = await serveFile(resolve(__dirname, '../data/irish-grid-xy.tif')));
 });
 afterAll(() => close());
+
+// A color function takes precedence over #dem, so don't let one test's leak into another
+afterEach(() => setColorFunction(url, undefined));
 
 describe('cogProtocol with a COG in EPSG:29902', () => {
   test('serves a TileJSON in geographic coordinates', async () => {
@@ -93,5 +96,44 @@ describe('cogProtocol with a COG in EPSG:29902', () => {
     const [, g2] = rgba(20, 200);
     expect(r2).toBeGreaterThanOrEqual(r1); // further east
     expect(g2).toBeGreaterThanOrEqual(g1); // further north
+  });
+
+  test('renders #dem terrain tiles whose heights are those of the reprojected pixels', async () => {
+    // Band 1 of the COG is the pixel's easting minus 300,000, so the height encoded for a tile pixel
+    // must be the easting of that pixel, found independently with the exact projection.
+    const irishGrid = getProjection(29902)!;
+    const [lon, lat] = irishGrid.toLonLat(321000, 352000);
+    const z = 13;
+    const n = 2 ** z;
+    const latRad = (lat * Math.PI) / 180;
+    const tile = {
+      z,
+      x: Math.floor(((lon + 180) / 360) * n),
+      y: Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n),
+    };
+
+    const {data} = (await cogProtocol({url: `cog://${url}#dem/${z}/${tile.x}/${tile.y}`, type: 'image'})) as {
+      data: FakeImageData;
+    };
+
+    const [west, south, east, north] = tileIndexToMercatorBbox(tile);
+    let checked = 0;
+    for (let row = 0; row < TILE_SIZE; row += 4) {
+      for (let column = 0; column < TILE_SIZE; column += 4) {
+        const x = west + ((column + 0.5) * (east - west)) / TILE_SIZE;
+        const y = north - ((row + 0.5) * (north - south)) / TILE_SIZE;
+        const [e, nn] = irishGrid.fromWebMercator(x, y);
+        if (!(e > EXTENT[0] + 100 && e < EXTENT[2] - 100 && nn > EXTENT[1] + 100 && nn < EXTENT[3] - 100)) continue;
+
+        const i = (row * TILE_SIZE + column) * 4;
+        const height = -10000 + (data.data[i] * 65536 + data.data[i + 1] * 256 + data.data[i + 2]) * 0.1;
+        if (height === 0 || Math.abs(height - (e - 300000)) > 1000) continue; // noData hole or out of range
+
+        expect(Math.abs(height - (e - 300000))).toBeLessThan(50); // within a source pixel
+        expect(data.data[i + 3]).toBe(255); // terrain tiles are opaque
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(500);
   });
 });
