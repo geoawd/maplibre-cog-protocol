@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Maplibre COG Protocol Example: Linford LiDAR, native vs reprojected</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^6.0.0/dist/maplibre-gl.css">
+  <script src="dist/index.js"></script>
+  <style>
+      html, body, #map {
+          margin: 0;
+          width: 100%;
+          height: 100%;
+      }
+
+      #panel {
+          position: absolute;
+          top: 8px;
+          left: 8px;
+          width: 300px;
+          max-width: calc(100% - 32px);
+          background: #ffffffee;
+          padding: 10px 12px;
+          border-radius: 5px;
+          font: 13px/1.4 sans-serif;
+          box-shadow: 0 1px 4px #0004;
+      }
+
+      #panel h1 {
+          font-size: 15px;
+          margin: 0 0 8px;
+      }
+
+      #panel label {
+          display: block;
+          margin: 4px 0;
+          cursor: pointer;
+      }
+
+      #panel .note {
+          margin: 2px 0 8px 22px;
+          color: #444;
+          font-size: 12px;
+      }
+
+      #panel .status {
+          font-family: monospace;
+          font-size: 12px;
+          color: #444;
+      }
+
+      #panel .error {
+          color: #b00020;
+      }
+
+      #readout {
+          margin-top: 8px;
+          padding-top: 6px;
+          border-top: 1px solid #ccc;
+          font-family: monospace;
+          font-size: 12px;
+          min-height: 3.6em;
+      }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Linford LiDAR: DTM and DSM</h1>
+
+  <label><input type="checkbox" id="toggleDtm" checked> Linford_DTM_3857.tif (terrain)</label>
+  <div class="note">Produced using GDAL in Python. Already in EPSG:3857, so it is read directly.</div>
+
+  <label><input type="checkbox" id="toggleDsm"> Linford_DSM.tif (surface)</label>
+  <div class="note">Re-projected: it is in the Irish Grid (EPSG:29902), not EPSG:3857, so the library reprojects it on the fly.</div>
+
+  <div class="status" id="status">Reading COG metadata…</div>
+  <div id="readout">Move the mouse over the data to read heights.</div>
+</div>
+<script type="module">
+  import * as maplibregl from 'https://unpkg.com/maplibre-gl@^6.0.0/dist/maplibre-gl.mjs';
+
+  const DTM_URL = 'https://data.better-open-data.com/lidar_zstd/Linford_DTM_3857.tif';
+  const DSM_URL = 'https://data.better-open-data.com/lidar_zstd/Linford_DSM.tif';
+
+  // The DSM is in the Irish Grid (EPSG:29902), which the library knows, so there is nothing to
+  // register. (A CRS it does not know is taught with MaplibreCOGProtocol.registerProjection.)
+  // The CRS the page reads from each file is shown in the panel.
+
+  maplibregl.addProtocol('cog', MaplibreCOGProtocol.cogProtocol);
+
+  // MapLibre writes the hash itself once the map loads, so note now whether the link had a position
+  const hadPosition = location.hash.length > 1;
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: 'https://tiles.openfreemap.org/styles/liberty',
+    center: [0, 51.5], // replaced by the extent of the DTM as soon as its metadata is read
+    zoom: 4,
+    hash: true
+  });
+
+  const status = document.getElementById('status');
+  const toggleDtm = document.getElementById('toggleDtm');
+  const toggleDsm = document.getElementById('toggleDsm');
+
+  const addLiDAR = (id, url, visible) => {
+    map.addSource(id, {type: 'raster-dem', url: `cog://${url}#dem`, tileSize: 256});
+    map.addLayer({
+      id,
+      source: id,
+      type: 'hillshade',
+      layout: {visibility: visible ? 'visible' : 'none'},
+      paint: {'hillshade-exaggeration': 0.8}
+    });
+  };
+
+  map.on('load', () => {
+    addLiDAR('dtm', DTM_URL, toggleDtm.checked);
+    addLiDAR('dsm', DSM_URL, toggleDsm.checked);
+
+    toggleDtm.onchange = () => map.setLayoutProperty('dtm', 'visibility', toggleDtm.checked ? 'visible' : 'none');
+    toggleDsm.onchange = () => map.setLayoutProperty('dsm', 'visibility', toggleDsm.checked ? 'visible' : 'none');
+  });
+
+  // Report what each COG really is, and go to the data
+  const describe = (name, metadata) => `${name}: ${metadata.crs ?? 'EPSG:3857'}${metadata.crs ? ' (reprojected)' : ' (direct)'}`;
+
+  Promise.allSettled([MaplibreCOGProtocol.getCogMetadata(DTM_URL), MaplibreCOGProtocol.getCogMetadata(DSM_URL)])
+    .then(([dtm, dsm]) => {
+      const lines = [];
+      const bounds = [];
+      for (const [name, result] of [['DTM', dtm], ['DSM', dsm]]) {
+        if (result.status === 'fulfilled') {
+          lines.push(describe(name, result.value));
+          if (result.value.bbox) bounds.push(result.value.bbox);
+        } else {
+          const line = document.createElement('div');
+          line.className = 'error';
+          line.textContent = `${name}: ${result.reason.message}`;
+          status.append(line);
+        }
+      }
+      status.prepend(document.createTextNode(lines.join(' | ')));
+
+      const first = bounds[0];
+      if (first && !hadPosition) {
+        map.fitBounds([[first[0], first[1]], [first[2], first[3]]], {padding: 40, animate: false});
+      }
+    });
+
+  // Heights under the pointer, and the difference between the surface and the terrain
+  const readout = document.getElementById('readout');
+  let busy = false;
+
+  map.on('mousemove', ({lngLat: {lat: latitude, lng: longitude}}) => {
+    if (busy) return;
+    busy = true;
+    const zoom = map.getZoom();
+
+    Promise.allSettled([
+      MaplibreCOGProtocol.locationValues(DTM_URL, {latitude, longitude}, zoom),
+      MaplibreCOGProtocol.locationValues(DSM_URL, {latitude, longitude}, zoom)
+    ]).then(([dtm, dsm]) => {
+      const height = (result) => (result.status === 'fulfilled' && Number.isFinite(result.value[0])) ? result.value[0] : NaN;
+      const [t, s] = [height(dtm), height(dsm)];
+      const fmt = (value) => Number.isNaN(value) ? 'no data' : `${value.toFixed(1)} m`;
+      readout.textContent = `DTM ${fmt(t)}\nDSM ${fmt(s)}` +
+        (Number.isNaN(t) || Number.isNaN(s) ? '' : `\nDSM - DTM ${(s - t).toFixed(1)} m`);
+      readout.style.whiteSpace = 'pre';
+    }).finally(() => busy = false);
+  });
+</script>
+</body>
+</html>

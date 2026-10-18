@@ -1,0 +1,79 @@
+export type TileJSON = {
+    tilejson: '2.2.0';
+    tiles: Array<string>;
+    name?: string;
+    description?: string;
+    version?: string;
+    attribution?: string;
+    template?: string;
+    legend?: string;
+    scheme?: string;
+    grids?: Array<string>;
+    data?: Array<string>;
+    minzoom: number;
+    maxzoom: number;
+    bounds?: Array<number>;
+    center?: Array<number>;
+};
+export type TileIndex = {
+    z: number;
+    x: number;
+    y: number;
+};
+export type Bbox = [number, number, number, number];
+/**
+ * The part of a tile that is actually covered by the COG, as a half-open rectangle of tile pixels:
+ * columns [left, right) and rows [top, bottom). Pixels outside it have no source pixel at all.
+ */
+export type TileCoverage = {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+    /**
+     * Only for COGs that had to be reprojected, whose border is not aligned with the tile grid: one
+     * entry per tile pixel (row by row), 1 if it has a source pixel and 0 if not.
+     */
+    footprint?: Uint8Array;
+};
+export type CogMetadata = {
+    offset: number;
+    scale: number;
+    noData?: number;
+    photometricInterpretation?: number;
+    bitsPerSample?: Array<number>;
+    colorMap?: Array<number>;
+    /** Index of the sample holding alpha, when the COG declares one in ExtraSamples. */
+    alphaBand?: number;
+    /** Whether that alpha is associated (TIFF ExtraSamples 1), i.e. the colors are premultiplied. */
+    premultipliedAlpha?: boolean;
+    artist?: string;
+    /** CRS of the COG, such as "EPSG:29902", when it is not Web Mercator and gets reprojected. */
+    crs?: string;
+    bbox?: Bbox;
+    images: Array<ImageMetadata>;
+};
+export type ImageMetadata = {
+    zoom: number;
+    isOverview: boolean;
+    isMask: boolean;
+};
+export type TypedArray = Uint8Array | Int8Array | Uint16Array | Int16Array | Uint32Array | Int32Array | Float32Array | Float64Array;
+export type ImageRenderer<T extends object> = (data: TypedArray, options: T) => Uint8ClampedArray<ArrayBuffer>;
+export type Location = {
+    latitude: number;
+    longitude: number;
+};
+export type LatLonZoom = {
+    latitude: number;
+    longitude: number;
+    zoom: number;
+};
+export type TilePixel = {
+    tileIndex: TileIndex;
+    row: number;
+    column: number;
+};
+type RGBAValue = Uint8ClampedArray;
+export type ColorFunction = (pixel: TypedArray, color: RGBAValue, metadata: CogMetadata) => void;
+export {};
