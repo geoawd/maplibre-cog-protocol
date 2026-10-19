@@ -2,7 +2,7 @@ import {RasterReprojector, type ReprojectionFns} from '@developmentseed/raster-r
 
 import {TILE_SIZE} from '../constants';
 import {tileIndexToMercatorBbox} from '../read/math';
-import type {TileIndex} from '../types';
+import type {Bbox, TileIndex} from '../types';
 import type {Reprojection} from './georeference';
 
 /** Maximum distance, in tile pixels, between the mesh and the exact projection. */
@@ -164,4 +164,43 @@ export const buildTileMapping = (tile: TileIndex, {projection, extent, geographi
   if (uMin <= uMax) mapping.bounds = [uMin, vMin, uMax, vMax];
 
   return mapping;
+};
+
+/**
+ * The same mapping for a COG that is already in Web Mercator, where tile pixels relate to the COG's
+ * by a plain scale and offset, so no mesh is needed. It lets such COGs be resampled bilinearly with
+ * the same code as the reprojected ones.
+ *
+ * @param extent The COG's extent in Web Mercator metres: [xMin, yMin, xMax, yMax].
+ */
+export const buildWebMercatorTileMapping = (tile: TileIndex, [xMin, yMin, xMax, yMax]: Bbox): TileMapping => {
+  const u = new Float64Array(TILE_SIZE * TILE_SIZE);
+  const v = new Float64Array(TILE_SIZE * TILE_SIZE);
+  const footprint = new Uint8Array(TILE_SIZE * TILE_SIZE);
+
+  const [west, south, east, north] = tileIndexToMercatorBbox(tile);
+  const pixelWidth = (east - west) / TILE_SIZE;
+  const pixelHeight = (north - south) / TILE_SIZE;
+
+  let uMin = Infinity;
+  let vMin = Infinity;
+  let uMax = -Infinity;
+  let vMax = -Infinity;
+  for (let row = 0; row < TILE_SIZE; row++) {
+    const rowV = (yMax - (north - (row + 0.5) * pixelHeight)) / (yMax - yMin);
+    for (let column = 0; column < TILE_SIZE; column++) {
+      const i = row * TILE_SIZE + column;
+      const columnU = (west + (column + 0.5) * pixelWidth - xMin) / (xMax - xMin);
+      u[i] = columnU;
+      v[i] = rowV;
+      if (columnU >= 0 && columnU < 1 && rowV >= 0 && rowV < 1) {
+        footprint[i] = 1;
+        if (columnU < uMin) uMin = columnU;
+        if (columnU > uMax) uMax = columnU;
+        if (rowV < vMin) vMin = rowV;
+        if (rowV > vMax) vMax = rowV;
+      }
+    }
+  }
+  return uMin <= uMax ? {u, v, footprint, bounds: [uMin, vMin, uMax, vMax]} : {u, v, footprint};
 };

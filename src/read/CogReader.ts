@@ -11,8 +11,8 @@ import QuickLRU from 'quick-lru';
 import {TILE_SIZE} from '../constants';
 import {parseNoData} from '../noData';
 import {detectReprojection, effectiveZoom, type Reprojection} from '../reproject/georeference';
-import {sampleTile, sourceWindow} from '../reproject/resample';
-import {buildTileMapping, type TileMapping} from '../reproject/tileMapping';
+import {type Resampling, sampleTile, sourceWindow} from '../reproject/resample';
+import {buildTileMapping, buildWebMercatorTileMapping, type TileMapping} from '../reproject/tileMapping';
 import type {Bbox, CogMetadata, ImageMetadata, TileCoverage, TileIndex, TileJSON, TypedArray} from '../types';
 import {
   mercatorBboxToGeographicBbox,
@@ -234,16 +234,17 @@ const CogReader = (url: string) => {
   };
 
   /**
-   * Reads a tile of a COG in another CRS: finds where the tile's pixels come from in the COG,
-   * reads just that part of the image at its own resolution, and picks the pixels out of it.
+   * Reads a tile through a mapping from its pixels to positions in the COG: reads just the part of
+   * the image the mapping touches, at its own resolution, and picks or blends the pixels from it.
+   * For COGs in another CRS, and for Web Mercator COGs that are to be resampled bilinearly.
    */
-  const readReprojectedTile = async (
-    reprojection: Reprojection,
-    tileIndex: TileIndex,
+  const readMappedTile = async (
+    mapping: TileMapping,
     image: GeoTIFFImage,
     fillValue: number,
+    noData: number | undefined,
+    resampling: Resampling,
   ): Promise<TypedArray> => {
-    const mapping = getTileMapping(reprojection, tileIndex);
     const imageWidth = image.getWidth();
     const imageHeight = image.getHeight();
 
@@ -258,7 +259,7 @@ const CogReader = (url: string) => {
       fillValue,
       pool,
     });
-    return sampleTile(mapping, raster, source, imageWidth, imageHeight, tile);
+    return sampleTile(mapping, raster, source, imageWidth, imageHeight, tile, resampling, noData);
   };
 
   /**
@@ -322,13 +323,22 @@ const CogReader = (url: string) => {
     })) as TypedArray;
   };
 
-  function getRawTile(tileIndex: TileIndex, options?: {mask?: false; tileSize?: number}): Promise<TypedArray>;
+  function getRawTile(
+    tileIndex: TileIndex,
+    options?: {mask?: false; tileSize?: number; resampling?: Resampling},
+  ): Promise<TypedArray>;
   function getRawTile(tileIndex: TileIndex, options: {mask: true; tileSize?: number}): Promise<TypedArray | null>;
   async function getRawTile(
     {z, x, y}: TileIndex,
-    {mask = false, tileSize = 256}: {mask?: boolean; tileSize?: number} = {},
+    {
+      mask = false,
+      tileSize = 256,
+      resampling: requestedResampling = 'nearest',
+    }: {mask?: boolean; tileSize?: number; resampling?: Resampling} = {},
   ): Promise<TypedArray | null> {
-    const cacheKey = `${url}/${mask ? 'mask/' : 'image/'}${tileSize}/${z}/${x}/${y}`;
+    // A mask holds 0 or 255: blending those would invent values in between
+    const resampling = mask ? 'nearest' : requestedResampling;
+    const cacheKey = `${url}/${mask ? 'mask/' : 'image/'}${tileSize}/${z}/${x}/${y}${resampling === 'nearest' ? '' : `/${resampling}`}`;
     const cachedTile = tileCache.get(cacheKey);
     if (cachedTile !== undefined) return cachedTile;
 
@@ -353,7 +363,17 @@ const CogReader = (url: string) => {
       return cacheWhileFulfilled(
         tileCache,
         cacheKey,
-        readReprojectedTile(reprojection, {x, y, z}, selectedImage, fillValue),
+        readMappedTile(getTileMapping(reprojection, {x, y, z}), selectedImage, fillValue, noData, resampling),
+      );
+    }
+
+    // Web Mercator COGs are read directly (and fast) unless asked to blend pixels
+    if (resampling === 'bilinear' && tileSize === TILE_SIZE) {
+      const mapping = buildWebMercatorTileMapping({x, y, z}, firstImage.getBoundingBox() as Bbox);
+      return cacheWhileFulfilled(
+        tileCache,
+        cacheKey,
+        readMappedTile(mapping, selectedImage, fillValue, noData, resampling),
       );
     }
 

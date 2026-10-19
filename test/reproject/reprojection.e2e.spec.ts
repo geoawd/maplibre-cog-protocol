@@ -22,14 +22,22 @@ const FILE = resolve(__dirname, '../data/irish-grid-xy.tif');
 const EXTENT = [300000, 330000, 351200, 381200];
 const NODATA = 65535;
 
+const FILE_3857 = resolve(__dirname, '../data/irish-grid-xy-3857.tif');
+
 let url: string;
 let close: () => void;
+let url3857: string;
+let close3857: () => void;
 
 beforeAll(async () => {
   ({url, close} = await serveFile(FILE));
+  ({url: url3857, close: close3857} = await serveFile(FILE_3857));
 });
 
-afterAll(() => close());
+afterAll(() => {
+  close();
+  close3857();
+});
 
 const tileAt = (lon: number, lat: number, z: number): TileIndex => {
   const n = 2 ** z;
@@ -190,5 +198,111 @@ describe('COG in EPSG:29902', () => {
 
     const outside = await locationValues(url, {latitude: 53.35, longitude: -6.26}, 16);
     expect(outside.every(Number.isNaN)).toBe(true);
+  });
+});
+
+/**
+ * Resampling, measured against the exact answer: every pixel of both COGs holds its own Irish Grid
+ * easting (minus 300,000), a field that is exactly linear in space. Bilinear interpolation of a linear
+ * field is exact, so it should be within a metre or so of the truth, while nearest neighbour is off by
+ * up to half a source pixel. The 3857 COG is the same data warped by GDAL, so it is read directly.
+ */
+describe.each([
+  ['reprojected, EPSG:29902', () => url, true],
+  ['native, EPSG:3857', () => url3857, false],
+])('resampling of a COG that is %s', (_, getUrl, sharesSampler) => {
+  const centre = (z: number) => tileAt(...(irishGrid.toLonLat(321000, 352000) as [number, number]), z);
+
+  /** Largest and mean error, in metres, of the easting in the pixels well inside the COG. */
+  const errors = async (resampling: 'nearest' | 'bilinear', tile: TileIndex) => {
+    const raw = await CogReader(getUrl()).getRawTile(tile, {resampling});
+    const found: number[] = [];
+    for (let row = 0; row < TILE_SIZE; row += 2) {
+      for (let column = 0; column < TILE_SIZE; column += 2) {
+        const [e, n] = expectedEastingNorthing(tile, row, column);
+        const margin = 500; // keep clear of the border, where edge pixels are not representative
+        if (!(e > EXTENT[0] + margin && e < EXTENT[2] - margin && n > EXTENT[1] + margin && n < EXTENT[3] - margin)) continue;
+        const value = raw[(row * TILE_SIZE + column) * 2];
+        if (value === NODATA) continue;
+        found.push(Math.abs(value + 300000 - e));
+      }
+    }
+    return {worst: Math.max(...found), mean: found.reduce((sum, value) => sum + value, 0) / found.length, count: found.length};
+  };
+
+  test('bilinear is accurate to a few metres where nearest is blocky', async () => {
+    const tile = centre(14); // overzoomed: a tile pixel is about 6 ground metres, a source pixel 50 or more
+
+    const bilinear = await errors('bilinear', tile);
+    const nearest = await errors('nearest', tile);
+
+    expect(bilinear.count).toBeGreaterThan(5000);
+    expect(bilinear.worst).toBeLessThan(5);
+    expect(bilinear.mean).toBeLessThan(1.5);
+
+    expect(nearest.worst).toBeGreaterThan(15);
+    expect(nearest.mean).toBeGreaterThan(5);
+  });
+
+  test('bilinear leaves the outline of the noData area as nearest has it, and never blends it into values', async () => {
+    // The hole is columns 240-360, rows 400-480 of the 50 m image: eastings 312000 to 318000, northings
+    // 357200 to 361200 (a little off in the warped COG). Tiles along its border straddle it, so they
+    // have valid and noData pixels with an edge between them, where blending could leak.
+    const tiles = new Map<string, TileIndex>();
+    const along = (from: number, to: number, point: (value: number) => [number, number]) => {
+      for (let value = from; value <= to; value += 200) {
+        const [lon, lat] = irishGrid.toLonLat(...point(value));
+        const tile = tileAt(lon, lat, 15);
+        tiles.set(`${tile.x}/${tile.y}`, tile);
+      }
+    };
+    along(357200, 361200, (n) => [312000, n]); // west edge
+    along(357200, 361200, (n) => [318000, n]); // east edge
+    along(312000, 318000, (e) => [e, 361200]); // north edge
+    along(312000, 318000, (e) => [e, 357200]); // south edge
+    const cog = CogReader(getUrl());
+    const count = (raw: ArrayLike<number>) => Array.from(raw).filter((value) => value === NODATA).length;
+
+    let straddling = 0;
+    for (const tile of tiles.values()) {
+      const nearest = await cog.getRawTile(tile, {resampling: 'nearest'});
+      const bilinear = await cog.getRawTile(tile, {resampling: 'bilinear'});
+
+      const holes = count(nearest) / 2; // pixels, of two samples each
+      if (holes < 100 || holes > TILE_SIZE * TILE_SIZE - 100) continue; // all valid, or all noData: no edge in it
+      straddling++;
+
+      if (sharesSampler) {
+        // Both methods pick pixels with the same code, so the outline is identical
+        expect(count(bilinear) / 2).toBe(holes);
+      } else {
+        // On a Web Mercator COG nearest takes the library's direct read, which rounds the window to
+        // whole source pixels and so places pixels up to about a source pixel off at strong
+        // overzoom. Bilinear places them exactly. So the outlines differ by less than a source pixel
+        // (171.7 Web Mercator metres in this COG) along an edge that crosses the tile
+        const [west, , east] = tileIndexToMercatorBbox(tile);
+        const sourcePixelInTilePixels = 171.7 / ((east - west) / TILE_SIZE);
+        expect(Math.abs(count(bilinear) / 2 - holes)).toBeLessThan(TILE_SIZE * Math.ceil(sourcePixelInTilePixels));
+      }
+      // A pixel blended with the 65535 of the hole would land between the highest real value and noData
+      expect(Array.from(bilinear).filter((value) => value > 51300 && value < NODATA)).toHaveLength(0);
+    }
+    expect(straddling).toBeGreaterThan(0);
+  });
+
+  test('nearest and bilinear are cached apart', async () => {
+    const tile = centre(14);
+    const cog = CogReader(getUrl());
+    const first = await cog.getRawTile(tile, {resampling: 'bilinear'});
+    const second = await cog.getRawTile(tile, {resampling: 'nearest'});
+    const third = await cog.getRawTile(tile, {resampling: 'bilinear'});
+
+    expect(Array.from(first)).not.toEqual(Array.from(second));
+    expect(Array.from(third)).toEqual(Array.from(first));
+  });
+
+  test('a mask is never blended: resampling is ignored for it', async () => {
+    // No mask band in these COGs: the answer is simply null, whatever resampling was asked for
+    expect(await CogReader(getUrl()).getRawTile(centre(14), {mask: true})).toBeNull();
   });
 });

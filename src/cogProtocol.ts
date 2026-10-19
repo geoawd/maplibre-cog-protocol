@@ -9,7 +9,11 @@ import {applyMask} from './render/mask';
 import renderColor from './render/renderColor';
 import renderPhoto from './render/renderPhoto';
 import renderTerrain from './render/renderTerrain';
+import {isResampling} from './reproject/resample';
 import type {TileJSON} from './types';
+
+// Optional last part of the hash: "#dem&resampling=nearest", "#color:viridis,0,100&resampling=bilinear"
+const RESAMPLING_OPTION = /&resampling=([^&]*)$/;
 
 const renderTile = async (url: string) => {
   // Read URL parameters
@@ -23,7 +27,16 @@ const renderTile = async (url: string) => {
 
   urlParts.shift();
 
-  const hash = urlParts.join('#') ?? '';
+  let hash = urlParts.join('#') ?? '';
+
+  const requestedResampling = RESAMPLING_OPTION.exec(hash)?.[1];
+  if (requestedResampling !== undefined) {
+    if (!isResampling(requestedResampling)) {
+      throw new Error(`Unknown resampling '${requestedResampling}'. Use 'nearest' or 'bilinear'`);
+    }
+    hash = hash.replace(RESAMPLING_OPTION, '');
+  }
+
   const z = parseInt(result[2], 10);
   const x = parseInt(result[3], 10);
   const y = parseInt(result[4], 10);
@@ -31,8 +44,15 @@ const renderTile = async (url: string) => {
   // Read COG data
   const cog = CogReader(cogUrl);
 
+  const renderCustom = CustomRendererStore.get(cogUrl);
+  const isTerrain = renderCustom === undefined && hash.startsWith('dem');
+
+  // Elevation is continuous: blocks of nearest neighbour would show as stair steps in the hillshade.
+  // Anything else keeps its pixel values untouched unless asked otherwise (MapLibre smooths images itself).
+  const resampling = requestedResampling ?? (isTerrain ? 'bilinear' : 'nearest');
+
   // Chained awaits. But parallelizing with Promise.all gave no gain.
-  const rawTile = await cog.getRawTile({z, x, y});
+  const rawTile = await cog.getRawTile({z, x, y}, {resampling});
   const rawMask = await cog.getRawTile({x, y, z}, {mask: true});
   const metadata = await cog.getMetadata();
 
@@ -45,8 +65,6 @@ const renderTile = async (url: string) => {
 
   let rgba: Uint8ClampedArray<ArrayBuffer>;
 
-  const renderCustom = CustomRendererStore.get(cogUrl);
-  const isTerrain = renderCustom === undefined && hash.startsWith('dem');
   if (renderCustom !== undefined) {
     rgba = renderCustom(rawTile, metadata); // a color function gets the COG's own metadata, untouched
   } else if (isTerrain) {

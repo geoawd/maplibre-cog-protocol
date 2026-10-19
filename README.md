@@ -510,8 +510,8 @@ A COG in a CRS that is unknown to the library throws an error saying so. Some th
 - The mapping from tile pixels to the COG's pixels uses the triangle meshing of
   [`@developmentseed/raster-reproject`](https://github.com/developmentseed/deck.gl-raster/tree/main/packages/raster-reproject)
   (the same used by deck.gl-raster), accurate to a fraction of a tile pixel.
-- Resampling is nearest neighbour, as for COGs in Web Mercator. Overview selection accounts for the
-  scale of Web Mercator at the COG's latitude, so overviews are picked as you would expect.
+- Overview selection accounts for the scale of Web Mercator at the COG's latitude, so overviews are
+  picked as you would expect. See [Resampling](#resampling) for how pixels are taken from them.
 - Accuracy is limited by the datum transformation. For the Irish Grid this is the 7-parameter Helmert
   transformation EPSG recommends, accurate to about 1 m. Grid-based transformations are not supported.
 - Rotated or sheared COGs, and COGs whose CRS is not identified by an EPSG code, are not supported.
@@ -520,6 +520,34 @@ A COG in a CRS that is unknown to the library throws an error saying so. Some th
 - `locationValues` and `getCogMetadata` (which reports the `crs`) work with reprojected COGs too.
 
 See the [reprojection example](https://github.com/geomatico/maplibre-cog-protocol/blob/main/examples/reprojection.html).
+
+### Resampling
+
+How a tile's pixels are taken from the COG's pixels, for COGs that are reprojected and for COGs that are
+already in Web Mercator:
+
+- `nearest`: the closest source pixel. Values are never altered, but pixels show as blocks when the COG is
+  coarser than the screen. Right for categories and class codes.
+- `bilinear`: a blend of the four closest source pixels. Smooth. Right for continuous data like elevation,
+  where blocks turn into stair-stepped hillshade.
+
+`#dem` is `bilinear` by default. Everything else is `nearest` by default (MapLibre already smooths images on
+the GPU). Choose with `&resampling=` at the end of the hash:
+
+```
+cog://https://example.com/lidar.tif#dem                         // bilinear
+cog://https://example.com/lidar.tif#dem&resampling=nearest      // blocky, original values
+cog://https://example.com/data.tif#color:viridis,0,100&resampling=bilinear
+```
+
+Bilinear never blends noData into a value: noData pixels take no part in the average, and a pixel whose nearest
+source pixel is noData stays noData, so the outline of the data is the one `nearest` gives. Integer data is
+rounded to the nearest integer. It does not smooth a COG's mask band (a mask holds 0 or 255), and for RGBA
+imagery with an alpha channel it blends colours with the alpha, which can leave a faint halo at transparent
+edges, so keep `nearest` there. `locationValues` returns the values of the COG's own pixels (`nearest`).
+
+> **Behaviour change:** `#dem` of a COG already in Web Mercator is now bilinear too. Add
+> `&resampling=nearest` to get the previous output.
 
 ### [unstable] Get COG metadata
 

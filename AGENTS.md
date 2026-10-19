@@ -56,6 +56,12 @@ positions in the COG's extent), reads the source window it needs, and `sampleTil
 (`effectiveZoom`), so overview selection is unchanged. The non-rectangular COG border is delivered
 as `TileCoverage.footprint`, applied by `applyCoverage`.
 
+Resampling (`reproject/resample.ts`): `getRawTile(tile, {resampling})` is `nearest` or `bilinear`;
+`cogProtocol` takes it from a `&resampling=` suffix of the hash and defaults `#dem` to bilinear. Reprojected
+COGs, and Web Mercator COGs asked for bilinear, go through a `TileMapping` and `sampleTile`; Web Mercator
+COGs with nearest keep the direct `readTileFast` path. Bilinear skips noData neighbours and keeps the
+nearest pixel's noData, so it never changes the outline of the data. Masks are always nearest.
+
 Two layers under `src/`:
 
 - **`read/`** — everything that touches the file. `CogReader` is a factory over `geotiff.js` with

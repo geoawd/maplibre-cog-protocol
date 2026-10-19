@@ -45,6 +45,11 @@ describe('cogProtocol with a COG in EPSG:29902', () => {
     expect(data.tiles).toEqual([`cog://${url}/{z}/{x}/{y}`]);
   });
 
+  test('keeps the resampling option in the tile URLs of the TileJSON, so MapLibre requests tiles with it', async () => {
+    const {data} = (await cogProtocol({url: `cog://${url}#dem&resampling=nearest`, type: 'json'})) as {data: TileJSON};
+    expect(data.tiles).toEqual([`cog://${url}#dem&resampling=nearest/{z}/{x}/{y}`]);
+  });
+
   test('renders a tile whose transparent area is the real, slanted outline of the COG', async () => {
     // Opaque whatever the pixel holds, so that any transparency comes from the COG's footprint, not
     // from noData. Red and green show the easting and northing the pixel holds.
@@ -135,5 +140,73 @@ describe('cogProtocol with a COG in EPSG:29902', () => {
       }
     }
     expect(checked).toBeGreaterThan(500);
+  });
+
+  describe('resampling option', () => {
+    const irishGrid = getProjection(29902)!;
+    const z = 14;
+    const tileFor = () => {
+      const [lon, lat] = irishGrid.toLonLat(321000, 352000);
+      const n = 2 ** z;
+      const latRad = (lat * Math.PI) / 180;
+      return {
+        z,
+        x: Math.floor(((lon + 180) / 360) * n),
+        y: Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n),
+      };
+    };
+
+    /** Worst error, in metres, of the heights of a #dem tile against the easting each pixel should hold. */
+    const worstHeightError = async (suffix: string) => {
+      const tile = tileFor();
+      const {data} = (await cogProtocol({url: `cog://${url}${suffix}/${z}/${tile.x}/${tile.y}`, type: 'image'})) as {
+        data: FakeImageData;
+      };
+      const [west, south, east, north] = tileIndexToMercatorBbox(tile);
+      let worst = 0;
+      for (let row = 0; row < TILE_SIZE; row += 3) {
+        for (let column = 0; column < TILE_SIZE; column += 3) {
+          const x = west + ((column + 0.5) * (east - west)) / TILE_SIZE;
+          const y = north - ((row + 0.5) * (north - south)) / TILE_SIZE;
+          const [e, nn] = irishGrid.fromWebMercator(x, y);
+          if (!(e > EXTENT[0] + 500 && e < EXTENT[2] - 500 && nn > EXTENT[1] + 500 && nn < EXTENT[3] - 500)) continue;
+          const i = (row * TILE_SIZE + column) * 4;
+          const height = -10000 + (data.data[i] * 65536 + data.data[i + 1] * 256 + data.data[i + 2]) * 0.1;
+          if (Math.abs(height - (e - 300000)) > 1000) continue; // the noData hole, encoded as 0 m
+          worst = Math.max(worst, Math.abs(height - (e - 300000)));
+        }
+      }
+      return worst;
+    };
+
+    test('#dem is resampled bilinearly by default', async () => {
+      expect(await worstHeightError('#dem')).toBeLessThan(5);
+    });
+
+    test('&resampling=nearest gives back the blocky nearest neighbour heights', async () => {
+      expect(await worstHeightError('#dem&resampling=nearest')).toBeGreaterThan(15);
+    });
+
+    test('&resampling=bilinear asks for it explicitly', async () => {
+      expect(await worstHeightError('#dem&resampling=bilinear')).toBeLessThan(5);
+    });
+
+    test('anything else than a color or terrain hash is nearest by default, and does not choke on the option', async () => {
+      setColorFunction(url, (pixel, color) => color.set([pixel[0] >> 8, pixel[1] >> 8, 0, 255]));
+      const tile = tileFor();
+      const request = (suffix: string) =>
+        cogProtocol({url: `cog://${url}${suffix}/${z}/${tile.x}/${tile.y}`, type: 'image'}) as Promise<{data: FakeImageData}>;
+
+      const byDefault = (await request('')).data.data;
+      const bilinear = (await request('#color:viridis,0,60000&resampling=bilinear')).data.data;
+      expect(Array.from(bilinear)).not.toEqual(Array.from(byDefault)); // the color function sees blended values
+    });
+
+    test('an unknown resampling is an error that says what is allowed', async () => {
+      const tile = tileFor();
+      await expect(
+        cogProtocol({url: `cog://${url}#dem&resampling=cubic/${z}/${tile.x}/${tile.y}`, type: 'image'}),
+      ).rejects.toThrow("Unknown resampling 'cubic'. Use 'nearest' or 'bilinear'");
+    });
   });
 });

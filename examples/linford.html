@@ -74,6 +74,9 @@
   <label><input type="checkbox" id="toggleDsm"> Linford_DSM.tif (surface)</label>
   <div class="note">Re-projected: it is in the Irish Grid (EPSG:29902), not EPSG:3857, so the library reprojects it on the fly.</div>
 
+  <label><input type="checkbox" id="toggleSmooth" checked> Smooth (bilinear resampling)</label>
+  <div class="note">On by default for <code>#dem</code>. Off adds <code>&amp;resampling=nearest</code>: blocky, original values. Applies to both layers.</div>
+
   <div class="status" id="status">Reading COG metadata…</div>
   <div id="readout">Move the mouse over the data to read heights.</div>
 </div>
@@ -103,9 +106,13 @@
   const status = document.getElementById('status');
   const toggleDtm = document.getElementById('toggleDtm');
   const toggleDsm = document.getElementById('toggleDsm');
+  const toggleSmooth = document.getElementById('toggleSmooth');
+
+  // #dem is bilinear unless told otherwise
+  const demUrl = (url) => `cog://${url}#dem${toggleSmooth.checked ? '' : '&resampling=nearest'}`;
 
   const addLiDAR = (id, url, visible) => {
-    map.addSource(id, {type: 'raster-dem', url: `cog://${url}#dem`, tileSize: 256});
+    map.addSource(id, {type: 'raster-dem', url: demUrl(url), tileSize: 256});
     map.addLayer({
       id,
       source: id,
@@ -121,6 +128,15 @@
 
     toggleDtm.onchange = () => map.setLayoutProperty('dtm', 'visibility', toggleDtm.checked ? 'visible' : 'none');
     toggleDsm.onchange = () => map.setLayoutProperty('dsm', 'visibility', toggleDsm.checked ? 'visible' : 'none');
+
+    // Changing the resampling changes the tiles' URL, so the sources are made again
+    toggleSmooth.onchange = () => {
+      for (const [id, url, toggle] of [['dtm', DTM_URL, toggleDtm], ['dsm', DSM_URL, toggleDsm]]) {
+        map.removeLayer(id);
+        map.removeSource(id);
+        addLiDAR(id, url, toggle.checked);
+      }
+    };
   });
 
   // Report what each COG really is, and go to the data
