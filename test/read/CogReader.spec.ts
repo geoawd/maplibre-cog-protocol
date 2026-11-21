@@ -160,14 +160,43 @@ describe('CogReader', () => {
 
   });
 
-  test('getMetadata throws for non-Mercator projections', async () => {
+  test('getMetadata throws for COGs that are not in Mercator when there is no reproject function', async () => {
     mockedFromUrl.mockReturnValueOnce(Promise.resolve({
       ...fakeGeoTIFF,
       getImage: () => Promise.resolve({...fakeFirstImage, getGeoKeys: () => ({ProjectedCSTypeGeoKey: 32636})}),
     } as any));
 
     await expect(CogReader('utm.tif').getMetadata())
-      .rejects.toThrow('EPSG:32636 in utm.tif is not supported');
+      .rejects.toThrow('utm.tif is in EPSG:32636, not in EPSG:3857 (Web Mercator), and no reprojection is set up');
+  });
+
+  test('a reproject function sets the CRS, bounds and zooms of a COG that is not in Mercator', async () => {
+    mockedFromUrl.mockReturnValueOnce(Promise.resolve({
+      ...fakeGeoTIFF,
+      getImage: (index?: number) => Promise.resolve(index === 1
+        ? fakeOverview
+        : {...fakeFirstImage, getGeoKeys: () => ({ProjectedCSTypeGeoKey: 32636}), getWidth: () => 16384, getHeight: () => 11264}),
+    } as any));
+    const reproject = vi.fn(({epsg}) => ({
+      crs: `EPSG:${epsg}`,
+      geographicBbox: [30, 10, 31, 11] as [number, number, number, number],
+      resolution: (width: number) => 156543.03392804097 / 2 ** (width === 8192 ? 12 : 14),
+      mapTile: vi.fn(),
+    }));
+
+    const cog = CogReader('reprojected.tif', reproject);
+
+    expect(await cog.getMetadata()).toMatchObject({
+      crs: 'EPSG:32636',
+      bbox: [30, 10, 31, 11],
+      images: [{zoom: expect.closeTo(14)}, {zoom: expect.closeTo(12)}],
+    });
+    expect(reproject).toHaveBeenCalledWith({
+      url: 'reprojected.tif',
+      epsg: 32636,
+      extent: [201640.881, 5098655.535, 206532.850, 5102018.764],
+    });
+    expect((await cog.getTilejson('cog://reprojected.tif')).maxzoom).toBe(14);
   });
 
   test('getTilejson returns a standard TileJSON document describing GeoTIFF as a data source', async () => {

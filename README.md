@@ -79,7 +79,7 @@ Or load it from a CDN with a `<script>` tag, as shown in the [vanilla HTML examp
 ## Requirements
 
 * MapLibre GL JS `^4.5.0`, `^5.0.0` or `^6.0.0` (peer dependency), except for `locationValues` and `getCogMetadata`, which work standalone. Note that MapLibre 6 dropped its UMD build, so it has to be loaded as an ES module, as in the example below.
-* COGs **must** be in EPSG:3857 (Web Mercator). This library does not reproject; reading a COG in any other projection throws an error. See [COG generation tips](#cog-generation-tips).
+* COGs should be in EPSG:3857 (Web Mercator). Reading a COG in any other projection throws an error, unless [reprojection](#reprojection) is set up. See [COG generation tips](#cog-generation-tips).
 
 ## Usage
 
@@ -482,6 +482,64 @@ clearMask();     // remove mask
 See [masking example](examples/masking.html) for a full working demo.
 
 
+### Reprojection
+
+COGs that are not in EPSG:3857 can be reprojected tile by tile in the browser: nothing needs to be preprocessed.
+
+The core library does not reproject by itself, which keeps it small. It has a hook for it,
+`setReproject(reproject)`, and without one a COG that is not in Web Mercator throws an error saying so.
+[`@geomatico/maplibre-cog-reproject`](https://github.com/geoawd/maplibre-cog-reproject) provides a `reproject` function based on
+[proj4](https://github.com/proj4js/proj4js) and the triangle meshing of
+[`@developmentseed/raster-reproject`](https://github.com/developmentseed/deck.gl-raster/tree/main/packages/raster-reproject):
+
+```
+import {cogProtocol, setReproject} from '@geomatico/maplibre-cog-protocol';
+import {reproject} from '@geomatico/maplibre-cog-reproject';
+
+setReproject(reproject);
+maplibregl.addProtocol('cog', cogProtocol);
+
+map.addSource('sourceId', {
+  type: 'raster',
+  url: 'cog://https://example.com/data/irish-grid.tif', // a COG in EPSG:29902
+  tileSize: 256
+});
+```
+
+See the [package's README](https://github.com/geoawd/maplibre-cog-reproject#readme) for the CRSs it knows and how to add others.
+Call `setReproject` before the COG is first requested: setting a different function discards what has been read so far.
+
+Some things to know:
+
+- Resampling is nearest neighbour, as for COGs in Web Mercator. Overview selection accounts for the
+  scale of Web Mercator at the COG's latitude, so overviews are picked as you would expect.
+- Rotated or sheared COGs, and COGs whose CRS is not identified by an EPSG code, are not supported.
+- COGs that only declare a geographic CRS (GeographicTypeGeoKey) used to be read as if they were in
+  Web Mercator, and drawn in the wrong place. They now need a `reproject` function that knows the CRS, and fail otherwise.
+- `locationValues` and `getCogMetadata` (which reports the `crs`) work with reprojected COGs too.
+
+#### Writing a `reproject` function
+
+`setReproject` takes any function of this shape, so other CRS libraries can be plugged in:
+
+```
+type Reproject = (source: {url: string; epsg: number; extent: [number, number, number, number]}) => Reprojection;
+
+type Reprojection = {
+  crs: string;                                   // e.g. 'EPSG:29902', reported in the metadata
+  geographicBbox: [number, number, number, number]; // extent as [west, south, east, north] degrees
+  // Web Mercator metres per pixel of an image of this size covering the extent (to pick overviews)
+  resolution: (imageWidth: number, imageHeight: number) => number;
+  // For a tile given by its Web Mercator bounds [west, south, east, north], where each of its
+  // 256 x 256 pixels is in the COG: see the TileMapping type
+  mapTile: (mercatorBbox: [number, number, number, number]) => TileMapping;
+};
+```
+
+It is called once per COG that is not in Web Mercator, and should throw if it does not support the CRS.
+
+See the [examples](https://github.com/geoawd/maplibre-cog-reproject/tree/main/examples) in the package's repository.
+
 ### [unstable] Get COG metadata
 
 Use the `getCogMetadata(url)` to obtain metadata about a COG file. It returns a promise resolving to:
@@ -573,7 +631,8 @@ later call won't affect files already opened.
 
 ## COG generation tips
 
-COG should be in EPSG:3857 (Google Mercator) projection, as this library doesn't reproject and won't understand any other projection.
+COGs in EPSG:3857 (Web Mercator) are the fastest, as their pixels need no conversion. COGs in other
+projections can be [reprojected on the fly](#reprojection) once a reproject function is set up.
 
 For better performance, use the Google Maps tiling scheme with 256x256 blocksize.
 

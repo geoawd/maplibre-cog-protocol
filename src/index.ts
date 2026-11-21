@@ -1,10 +1,12 @@
 import cogProtocol from './cogProtocol';
-import {getCogMetadata, setRequestHeaders} from './read/CogReader';
+import {getCogMetadata, setReproject, setRequestHeaders} from './read/CogReader';
 import locationValues from './read/locationValues';
 import {colorScale, colorSchemeNames} from './render/colorScale';
 import setColorFunction from './render/custom/setColorFunction';
 import {clearMask, setMask} from './render/mask';
+import type {Bbox, Reproject, Reprojection, ReprojectSource, TileMapping} from './types';
 
+export type {Bbox, Reproject, Reprojection, ReprojectSource, TileMapping};
 export {
   clearMask,
   cogProtocol,
@@ -14,5 +16,6 @@ export {
   locationValues,
   setColorFunction,
   setMask,
+  setReproject,
   setRequestHeaders,
 };

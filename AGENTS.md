@@ -9,8 +9,12 @@ Cloud Optimized GeoTIFF can be used directly as a `raster` or `raster-dem` sourc
 server. The library fetches byte ranges of the remote GeoTIFF, decodes the pixels for the requested
 XYZ tile, converts them to RGBA, and hands MapLibre an `ImageBitmap`.
 
-Hard constraint: **COGs must be in EPSG:3857 (Web Mercator)**. There is no reprojection; a COG with
-any other `ProjectedCSTypeGeoKey` throws in `getMetadata`.
+COGs in EPSG:3857 (Web Mercator) are read directly. COGs in another CRS are reprojected per tile
+through a hook: the core only knows the `Reproject` function type (`src/types.ts`) and has no CRS
+library. The user gives it with `setReproject`, normally the one from the separate package
+`@geomatico/maplibre-cog-reproject` (repo `geoawd/maplibre-cog-reproject`, which owns proj4, the mesher,
+the reprojection examples and the end-to-end tests on a real COG). Without one, a COG in another CRS
+throws in `getMetadata`.
 
 ## Commands
 
@@ -47,6 +51,14 @@ Request flow for one tile (`src/cogProtocol.ts` is the entry point and the only 
 2. MapLibre then asks for `cog://<url>#<hash>/{z}/{x}/{y}` with `type: 'image'` → `renderTile()`
    parses the URL, reads raw pixels + the optional mask band, picks a renderer from the hash, and
    returns an `ImageBitmap`.
+
+Reprojection (`src/reproject/`) only touches `CogReader`: for a non-Mercator COG, `getMetadata` asks the
+`Reproject` hook for a `Reprojection` (CRS, geographic bbox, `resolution`, `mapTile`). `getRawTile` gets a
+`TileMapping` from `mapTile` (in the package, a `@developmentseed/raster-reproject` mesh over the *tile*,
+rasterized into per-pixel positions in the COG's extent), reads the source window it needs, and `sampleTile`s it into a normal
+256×256 raster, so `render/` is unaware. Image zooms in the metadata are the Web Mercator equivalent
+(`effectiveZoom`, from `Reprojection.resolution`), so overview selection is unchanged. The non-rectangular COG border is delivered
+as `TileCoverage.footprint`, applied by `applyCoverage`.
 
 Two layers under `src/`:
 
@@ -92,5 +104,5 @@ the bare COG URL without the `cog://` prefix.
   allocation-free and branch-light; existing code deliberately indexes flat typed arrays rather
   than building objects.
 - Tests mock `geotiff` with `vi.mock` and hand-built fake image objects; there are no fixture
-  `.tif` files in `test/`. Test layout mirrors `src/`.
+  `.tif` files in `test/`. Reprojection tests use a fake `Reproject`. Test layout mirrors `src/`.
 - Public API changes need a `README.md` update, and breaking ones an entry in `MIGRATIONS.md`.

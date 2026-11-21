@@ -8,25 +8,49 @@ import {
 } from 'geotiff';
 import QuickLRU from 'quick-lru';
 
+import {TILE_SIZE} from '../constants';
 import {parseNoData} from '../noData';
-import type {Bbox, CogMetadata, ImageMetadata, TileCoverage, TileIndex, TileJSON, TypedArray} from '../types';
+import {detectReprojection, effectiveZoom} from '../reproject/georeference';
+import {sampleTile, sourceWindow} from '../reproject/resample';
+import type {
+  Bbox,
+  CogMetadata,
+  ImageMetadata,
+  Reproject,
+  Reprojection,
+  TileCoverage,
+  TileIndex,
+  TileJSON,
+  TileMapping,
+  TypedArray,
+} from '../types';
 import {
   mercatorBboxToGeographicBbox,
   pixelWindowToTileCoverage,
+  tileIndexToMercatorBbox,
   tileIndexToPixelWindow,
   zoomFromResolution,
 } from './math';
-import {readTileFast} from './readTile';
+import {emptyRaster, readTileFast} from './readTile';
 
 const ONE_HOUR_IN_MILLISECONDS = 60 * 60 * 1000;
 
 let pool: Pool;
 let requestHeaders: Record<string, string> | undefined;
+let defaultReproject: Reproject | undefined;
 
 const geoTiffCache = new QuickLRU<string, Promise<GeoTIFF>>({maxSize: 16, maxAge: ONE_HOUR_IN_MILLISECONDS});
 const metadataCache = new QuickLRU<string, Promise<CogMetadata>>({maxSize: 16, maxAge: ONE_HOUR_IN_MILLISECONDS});
 const imageCache = new QuickLRU<string, Promise<GeoTIFFImage>>({maxSize: 64, maxAge: ONE_HOUR_IN_MILLISECONDS});
 const tileCache = new QuickLRU<string, Promise<TypedArray>>({maxSize: 1024, maxAge: ONE_HOUR_IN_MILLISECONDS});
+
+// For COGs that are not in Web Mercator. How they relate to it, and, for the tiles being rendered,
+// where each tile pixel comes from. The latter is shared by the image, its mask and the coverage.
+const reprojectionCache = new QuickLRU<string, {reprojection?: Reprojection}>({
+  maxSize: 16,
+  maxAge: ONE_HOUR_IN_MILLISECONDS,
+});
+const tileMappingCache = new QuickLRU<string, TileMapping>({maxSize: 24, maxAge: ONE_HOUR_IN_MILLISECONDS});
 
 /**
  * Caches a pending promise so concurrent callers share one request, but drops it again if it
@@ -63,7 +87,12 @@ const alphaSample = (
   return {alphaBand: samplesPerPixel - values.length + index, premultipliedAlpha: values[index] === 1};
 };
 
-const CogReader = (url: string) => {
+/**
+ * @param reproject Reprojects COGs that are not in Web Mercator. Defaults to the one set with
+ *   setReproject. Caches are shared across readers and keyed by URL, so a given URL should always be
+ *   read with the same one.
+ */
+const CogReader = (url: string, reproject: Reproject | undefined = defaultReproject) => {
   if (pool === undefined) {
     pool = new Pool();
   }
@@ -110,12 +139,17 @@ const CogReader = (url: string) => {
       const tiff = await getGeoTiff(url);
       const firstImage = await getImage(tiff, 0);
 
-      const projectedCSType = firstImage.getGeoKeys()?.ProjectedCSTypeGeoKey;
-      if (projectedCSType !== undefined && projectedCSType !== 3857 && projectedCSType !== 102113) {
-        throw new Error(
-          `COG projection EPSG:${projectedCSType} in ${url} is not supported. Reproject to EPSG:3857 (Web Mercator).`,
-        );
-      }
+      // Web Mercator COGs are read as they are. Any other CRS has to be reprojected, which needs to
+      // know what the COG's CRS is: detectReprojection throws if it can't.
+      const modelTransformation = await firstImage.fileDirectory?.loadValue('ModelTransformation');
+      const isRotated = !!modelTransformation && (modelTransformation[1] !== 0 || modelTransformation[4] !== 0);
+      const reprojection = detectReprojection(
+        url,
+        firstImage.getGeoKeys(),
+        firstImage.getBoundingBox() as Bbox,
+        isRotated,
+        reproject,
+      );
 
       const gdalMetadata = await firstImage.getGDALMetadata(0); // Metadata for first image and first sample
       const fileDirectory = firstImage.fileDirectory;
@@ -125,14 +159,18 @@ const CogReader = (url: string) => {
       const rawColorMap = await fileDirectory?.loadValue('ColorMap');
       const rawExtraSamples = await fileDirectory?.loadValue('ExtraSamples');
       const samplesPerPixel = await fileDirectory?.loadValue('SamplesPerPixel');
-      const bbox = mercatorBboxToGeographicBbox(firstImage.getBoundingBox() as Bbox);
+      const bbox = reprojection
+        ? reprojection.geographicBbox
+        : mercatorBboxToGeographicBbox(firstImage.getBoundingBox() as Bbox);
 
       const imagesMetadata: Array<ImageMetadata> = [];
       const imageCount = await tiff.getImageCount();
       for (let index = 0; index < imageCount; index++) {
         const image = await getImage(tiff, index);
         const newSubFileType = (await image.fileDirectory.loadValue('NewSubfileType')) ?? 0;
-        const zoom = zoomFromResolution(image.getResolution(firstImage)[0]);
+        const zoom = reprojection
+          ? effectiveZoom(reprojection, image.getWidth(), image.getHeight())
+          : zoomFromResolution(image.getResolution(firstImage)[0]);
         const isOverview = !!(newSubFileType & 1);
         const isMask = !!(newSubFileType & 4);
         imagesMetadata.push({zoom, isOverview, isMask});
@@ -148,10 +186,12 @@ const CogReader = (url: string) => {
         colorMap: rawColorMap ? Array.from(rawColorMap) : undefined,
         ...alphaSample(rawExtraSamples, samplesPerPixel ?? rawBitsPerSample?.length),
         artist: artist,
+        crs: reprojection?.crs,
         bbox: bbox,
         images: imagesMetadata,
       };
 
+      reprojectionCache.set(url, {reprojection});
       // @ts-expect-error metadata will be wrapped with a Promise
       metadataCache.set(url, metadata);
 
@@ -196,6 +236,49 @@ const CogReader = (url: string) => {
     return bestImage.index;
   };
 
+  const getReprojection = async (): Promise<Reprojection | undefined> => {
+    await getMetadata();
+    return reprojectionCache.get(url)?.reprojection;
+  };
+
+  const getTileMapping = (reprojection: Reprojection, {z, x, y}: TileIndex): TileMapping => {
+    const key = `${url}/${z}/${x}/${y}`;
+    const cached = tileMappingCache.get(key);
+    if (cached) return cached;
+
+    const mapping = reprojection.mapTile(tileIndexToMercatorBbox({z, x, y}));
+    tileMappingCache.set(key, mapping);
+    return mapping;
+  };
+
+  /**
+   * Reads a tile of a COG in another CRS: finds where the tile's pixels come from in the COG,
+   * reads just that part of the image at its own resolution, and picks the pixels out of it.
+   */
+  const readReprojectedTile = async (
+    reprojection: Reprojection,
+    tileIndex: TileIndex,
+    image: GeoTIFFImage,
+    fillValue: number,
+  ): Promise<TypedArray> => {
+    const mapping = getTileMapping(reprojection, tileIndex);
+    const imageWidth = image.getWidth();
+    const imageHeight = image.getHeight();
+
+    const tile = emptyRaster(image, TILE_SIZE * TILE_SIZE * image.getSamplesPerPixel(), fillValue);
+    const source = mapping.bounds ? sourceWindow(mapping.bounds, imageWidth, imageHeight) : undefined;
+    if (!source) return tile;
+
+    const raster = await readTile(image, {
+      window: source.window,
+      width: source.width,
+      height: source.height,
+      fillValue,
+      pool,
+    });
+    return sampleTile(mapping, raster, source, imageWidth, imageHeight, tile);
+  };
+
   /**
    * Which tile pixels are backed by actual image data. A tile at the border of the COG is only
    * partially covered by it, and the rest of it is filled with the read fillValue, which for
@@ -209,6 +292,15 @@ const CogReader = (url: string) => {
     const imageIndex = selectImageIndex(images, z, false);
 
     if (imageIndex === null) return {left: 0, top: 0, right: 0, bottom: 0};
+
+    const reprojection = await getReprojection();
+    if (reprojection) {
+      // The COG's border is not a rectangle of the tile, but the footprint tells which pixels are in.
+      const {bounds, footprint} = getTileMapping(reprojection, {z, x, y});
+      return bounds
+        ? {left: 0, top: 0, right: tileSize, bottom: tileSize, footprint}
+        : {left: 0, top: 0, right: 0, bottom: 0};
+    }
 
     const tiff = await getGeoTiff(url);
     const firstImage = await getImage(tiff, 0);
@@ -273,6 +365,16 @@ const CogReader = (url: string) => {
     const firstImage = await getImage(tiff, 0);
     const selectedImage = await getImage(tiff, imageIndex);
 
+    const reprojection = await getReprojection();
+    if (reprojection) {
+      if (tileSize !== TILE_SIZE) throw new Error(`Reprojected COGs only support ${TILE_SIZE}px tiles`);
+      return cacheWhileFulfilled(
+        tileCache,
+        cacheKey,
+        readReprojectedTile(reprojection, {x, y, z}, selectedImage, fillValue),
+      );
+    }
+
     const window = tileIndexToPixelWindow(
       {x, y, z},
       firstImage.getBoundingBox(),
@@ -289,6 +391,20 @@ const CogReader = (url: string) => {
 };
 
 export const getCogMetadata = (url: string) => CogReader(url).getMetadata();
+
+/**
+ * Sets the function that reprojects COGs that are not in Web Mercator, or removes it when called
+ * with undefined. Without one such COGs are rejected.
+ */
+export const setReproject = (reproject: Reproject | undefined) => {
+  if (reproject === defaultReproject) return;
+  defaultReproject = reproject;
+  // What was read before may have been read, or refused, under the previous function.
+  metadataCache.clear();
+  reprojectionCache.clear();
+  tileMappingCache.clear();
+  tileCache.clear();
+};
 
 export const setRequestHeaders = (headers: Record<string, string>) => {
   requestHeaders = headers;
