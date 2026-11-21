@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multiple reprojections on one map</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@^6.0.0/dist/maplibre-gl.css">
+  <script src="dist/index.js"></script>
+  <style>
+      html, body, #map {
+          margin: 0;
+          width: 100%;
+          height: 100%;
+      }
+
+      #panel {
+          position: absolute;
+          top: 8px;
+          left: 8px;
+          max-width: min(390px, calc(100% - 32px));
+          background: #ffffffee;
+          padding: 10px 12px;
+          border-radius: 5px;
+          font: 13px/1.4 sans-serif;
+          box-shadow: 0 1px 4px #0004;
+      }
+
+      #panel h1 {
+          font-size: 15px;
+          margin: 0 0 8px;
+      }
+
+      #panel p {
+          margin: 6px 0;
+      }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Register and reproject two EPSG codes on one map</h1>
+  <p>Both COGs are reprojected to Web Mercator. The 4-band image is draped over the DEM terrain; use the map's
+    compass or right-drag to rotate and tilt the 3D view.</p>
+  <p><b>Vermont State DEM (EPSG:6589)</b> 35 cm DEM COG</p>
+  <p><b>4 Band RGB Vermont State (EPSG:26918)</b>30 cm leaf-off imagery COG</p>
+  <p>Data: <a href="https://vtopendata-prd.s3-us-east-2.amazonaws.com/index.html" target="_blank" rel="noreferrer">
+    Vermont Center for Geographic Information Open Data Bucket</a></p>
+</div>
+<script type="module">
+  import * as maplibregl from 'https://unpkg.com/maplibre-gl@^6.0.0/dist/maplibre-gl.mjs';
+
+  const DEM_URL = 'https://s3.us-east-2.amazonaws.com/vtopendata-prd/Elevation/STATEWIDE_2023_35cm_DEMHF.tif';
+  const IMAGERY_URL = 'https://s3.us-east-2.amazonaws.com/vtopendata-prd/Imagery/STATEWIDE_2024_30cm_LeafOFF_4Band.tif';
+
+  MaplibreCOGProtocol.registerProjection(
+    6589,
+    '+proj=tmerc +lat_0=42.5 +lon_0=-72.5 +k=0.999964286 +x_0=500000 +y_0=0 +ellps=GRS80 ' +
+      '+towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs'
+  );
+  MaplibreCOGProtocol.registerProjection(
+    26918,
+    '+proj=utm +zone=18 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs'
+  );
+
+  maplibregl.addProtocol('cog', MaplibreCOGProtocol.cogProtocol);
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: 'https://tiles.openfreemap.org/styles/liberty',
+    center: [-72.7, 44],
+    zoom: 7,
+    pitch: 60,
+    maxPitch: 85,
+    hash: true
+  });
+  map.addControl(new maplibregl.NavigationControl({visualizePitch: true}), 'top-right');
+
+  map.on('load', () => {
+    map.addSource('vermont-dem', {
+      type: 'raster-dem',
+      url: `cog://${DEM_URL}#dem`,
+      tileSize: 256
+    });
+    map.setTerrain({source: 'vermont-dem'});
+
+    map.addSource('vermont-imagery', {
+      type: 'raster',
+      url: `cog://${IMAGERY_URL}`,
+      tileSize: 256
+    });
+    map.addLayer({
+      id: 'vermont-imagery',
+      source: 'vermont-imagery',
+      type: 'raster'
+    });
+  });
+</script>
+</body>
+</html>
